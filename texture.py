@@ -279,98 +279,144 @@ def preprocess_for_shadow(
 # mask to further distinguish shadows
 def make_shadow_mask(
     img_bgr,
-    beta = 0.8,    # projection weight of Y into I' (0 < beta <= 1)
-    win_scales = (21, 41, 81),    # local mean windows (pixels)
-    k_dark = (0.92, 0.95, 0.98),    # darker than local mean factors
-    dr = 0.06, dg = 0.06,   # chroma-consistency tolerance in normalized RGB
-    morph_open = 3,
-    morph_close = 7,
-    min_area = 400,
-): 
-    '''
-    based on paper by Uddin, Khanam, Khan, Deb, and Jo detailing color models HSI and YCbCr:
-    1. chromatic attainment on S: Im = S - log(S + delta)
-    2. intensity attainment: I' = I + beta * Y    (Y is from YCrCb color model)
-    3. shadow if I' is highly saturated and S' (boosted) is low
-    SUMMARY: shadow are dark regions that
-    - have low saturation
-    - stay dark after brightness is adjusted
-    - maintain consistent color but just get darker
-    '''
+    beta=0.6,
+    win_scales=(21, 41, 81),
+    k_dark = (0.92, 0.95, 0.98),
+    dr=0.06, dg=0.06,
+    morph_open=5,
+    morph_close=10,
+    min_area=400,
+):
 
-    '''
-    IMPROVEMENTS THAT NEED TO BE MADE:
-    - handle extreme brightness and darkness
-    - parameter tuning based on image stats
-    - refine to catch missed shadows
-    - more robust threshold selections 
-    '''
-    # apply preprocessing to image before masking
-    img_bgr = preprocess_for_shadow(img_bgr)
+    # ----- STEP 0: Light smoothing -----
+    img_bgr = cv.GaussianBlur(img_bgr, (5, 5), 0)
 
-    # convert BGR to HSI in linear light (hue, saturation, intensity)
+    # ----- STEP 1: Convert to HSI Linear -----
     _, S, I = bgr_to_hsi_linear(img_bgr)
 
-    # find dark regions (regions of interest) using multiple window sizes
+    # ----- STEP 2: Scene brightness statistics -----
+    mean_I = np.mean(I)
+    std_I  = np.std(I)
+    avg_S  = np.mean(S)
+
+    # ----- STEP 3: Dynamic k_dark (darker-than-local thresholds) -----
+    contrast_factor = np.clip(std_I * 3.0, 0.6, 1.4)
+    dark_base = 0.9 - (mean_I - 0.5) * 0.2
+    dark_base = np.clip(dark_base, 0.82, 0.96)
+
+    k_dark = (
+        dark_base - 0.04 * contrast_factor,
+        dark_base - 0.02 * contrast_factor,
+        dark_base,
+    )
+
+    # ----- STEP 4: Local darkness detection -----
     meanI = [box_mean(I, w) for w in win_scales]
     darks = [(I < (kk * m)) for m, kk in zip(meanI, k_dark)]
     roi_dark = darks[0] | darks[1] | darks[2]
-    
+
     if not np.any(roi_dark):
-        print("roi_dark is empty → returning empty mask.")
         return np.zeros(I.shape, np.uint8), (I * 255).astype(np.float32)
-    
-    # chromatic attainment (1) 
-    # Sm = S - np.log(S + delta)
-    # SKIPPED chromatic attainment; used raw saturation with thresholds instead since shadows typically have low saturation in the image 
 
-    # boost intensity using luminance (Y channel from YCrCb)
-    # B, G, R = cv.split(srgb_to_linear(img_bgr))
-    B, G, R = cv.split(img_bgr.astype(np.float32))
-    Rl = srgb_to_linear(R)
-    Gl = srgb_to_linear(G)
-    Bl = srgb_to_linear(B)
-    
-    # common approximation to convert RGB to linear luminance (how bright each pixel appears to human eye)
-    # coefficients (0.114, 0.587, 0.299) are based on sensitivity of the human eye to diff light wavelengths
-    Y_lin = 0.114*Bl + 0.587*Gl + 0.299*Rl
+    # ----- STEP 5: Convert to luminance for intensity boost -----
+    B, G, R = cv.split(img_bgr.astype(np.float32) / 255.0)
+    Rl = srgb_to_linear(R * 255) / 255.0
+    Gl = srgb_to_linear(G * 255) / 255.0
+    Bl = srgb_to_linear(B * 255) / 255.0
+    Y_lin = 0.114 * Bl + 0.587 * Gl + 0.299 * Rl
+
+    # dynamic beta
+    beta = np.clip(0.8 - (mean_I - 0.5) * 0.5, 0.5, 1.0)
+
+    # intensity boost
     Iprime_raw = I + beta * Y_lin
-
-    # normalize the boosted intensity I' by a high percentile inside dark region of interest (adaptive to scene/image)
     scale = float(np.percentile(Iprime_raw[roi_dark], 95))
     Iprime = np.clip(Iprime_raw / max(scale, 1e-6), 0.0, 1.0)
 
-    # check chroma-consistency (checked since shadows dim/get darker but do not change color)
+    # ----- STEP 6: Chroma consistency -----
     nr, ng = normalized_rgb(img_bgr)
-    mnr = box_mean(nr, 41)  # mean of normalized r
-    mng = box_mean(ng, 41)  # mean of normalized g
+    mnr = box_mean(nr, 41)
+    mng = box_mean(ng, 41)
+
+    # adaptive chroma tolerance
+    dr = dg = np.clip(0.05 + (avg_S - 0.3) * 0.1, 0.03, 0.08)
+
     chroma_ok = (np.abs(nr - mnr) < dr) & (np.abs(ng - mng) < dg)
 
-    # self-tuning thresholds (saturation and intensity) from region of interest percentiles
-    S_thr = float(min(0.30, np.percentile(S[roi_dark], 40) + 0.02))
-    Ip_thr = float(np.percentile(Iprime[roi_dark], 60))
+    # ----- STEP 7: Compute shadow likelihood (continuous) -----
+    darkness_level = np.mean(I[roi_dark])
 
-    '''
-    constraints for shadow mask based on if I' = 255 & S about 0;
-    to make it adaptive to all images, a pixel is considered a shadow if it has:
-    - low saturation (S below given threshold)
-    - low intensity even after intensity boost (I' < I_threshold) -> (shadows stay dark after boost)
-    - were already dark before intensity boost (roi_dark) -> (dark to begin with)
-    - shadows do not change color even after boost (chroma_ok) -> (consistent color)
-    '''
-    mask = (roi_dark & chroma_ok & (S <= S_thr) & (Iprime <= Ip_thr)).astype(np.uint8) * 255
+    sat_percentile = 30 + 40 * (1 - darkness_level)  # 30–70
+    int_percentile = 40 + 30 * (1 - darkness_level)  # 40–70
 
-    # use morphological image processing to remove specks and fill in small holes (cleaning up the mask)
+    S_thr = float(min(0.4, np.percentile(S[roi_dark], sat_percentile) + 0.03))
+    Ip_thr = float(np.percentile(Iprime[roi_dark], int_percentile))
+
+    # likelihood score ∈ [0,1]
+    shadow_likelihood = (
+        (1 - np.clip(S / (S_thr + 1e-6), 0, 1)) *
+        (1 - np.clip(Iprime / (Ip_thr + 1e-6), 0, 1))
+    )
+
+    # dynamic threshold selection by distribution
+    shadow_cut = np.percentile(shadow_likelihood, 75)
+    mask = (shadow_likelihood > shadow_cut).astype(np.uint8) * 255
+
+    # ----- STEP 8: Dominant shadow direction -----
+    gx = cv.Sobel(Iprime, cv.CV_32F, 1, 0, ksize=3)
+    gy = cv.Sobel(Iprime, cv.CV_32F, 0, 1, ksize=3)
+    ang = np.arctan2(gy, gx)
+
+    # Use high likelihood pixels to estimate direction
+    dir_mask = shadow_likelihood > shadow_cut
+    if np.any(dir_mask):
+        hist, bins = np.histogram(ang[dir_mask], bins=36, range=(-np.pi, np.pi))
+        dominant_angle = bins[np.argmax(hist)]
+    else:
+        dominant_angle = 0.0
+
+    # angular filtering (remove random-direction blobs)
+    angle_diff = np.abs(np.angle(np.exp(1j * (ang - dominant_angle))))
+    mask[(angle_diff > np.deg2rad(35))] = 0
+
+    # ----- STEP 9: Conditional vegetation suppression -----
+    hsv = cv.cvtColor(img_bgr, cv.COLOR_BGR2HSV)
+    H, S_hsv, V_hsv = cv.split(hsv)
+
+    green_candidates = ((H > 25) & (H < 90) & (S_hsv > 50))
+
+    # greenery dark enough?
+    local_mean = cv.boxFilter(V_hsv.astype(np.float32), -1, (15, 15))
+    green_dark = V_hsv.astype(np.float32) < (0.92 * local_mean)
+
+    # greenery aligned with shadow direction?
+    green_dir_ok = angle_diff < np.deg2rad(35)
+
+    # INVALID GREEN = leafy blobs NOT aligned with sun & not dark enough
+    invalid_green = green_candidates & ~(green_dark & green_dir_ok)
+    mask[invalid_green] = 0
+
+    # ----- STEP 10: Morphological cleanup -----
+    h, w = img_bgr.shape[:2]
+    scale_factor = np.sqrt((h * w) / (1080 * 1920))
+
+    morph_open = max(3, int(morph_open * scale_factor))
+    morph_close = max(7, int(morph_close * scale_factor))
+    min_area = int(min_area * scale_factor**2)
+
     if morph_open > 1:
         k1 = cv.getStructuringElement(cv.MORPH_ELLIPSE, (morph_open, morph_open))
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, k1)
+
     if morph_close > 1:
         k2 = cv.getStructuringElement(cv.MORPH_ELLIPSE, (morph_close, morph_close))
         mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, k2)
+
     mask = remove_small(mask, min_area=min_area)
-    
-    # return mask and luminance channel to reuse (considered V in paper)
-    return mask, (I * 255).astype(np.float32)  
+    mask = cv.GaussianBlur(mask, (5, 5), 0)
+
+    return mask, (I * 255).astype(np.float32)
+ 
 
 # ----------------------------------------------------------
 # TEXTURE COMPARISON AND HELPERS FOR TAMPER SCORE
@@ -955,5 +1001,5 @@ def analyze_texture(image_input, visualize=True, compute_tamper_score=True, max_
 
 
 if __name__ == "__main__":
-    result = analyze_texture("data/images/5.jpg", visualize=True)
+    result = analyze_texture("data/images/32.jpg", visualize=True)
     print("\nExtracted features:", result["features"])
